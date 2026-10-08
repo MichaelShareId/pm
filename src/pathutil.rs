@@ -17,8 +17,9 @@ pub fn normalize_path(input: &str) -> Result<String> {
         if part == "." || part == ".." {
             bail!("path must not contain `.` or `..` segments");
         }
-        if part.contains('\0') {
-            bail!("path must not contain NUL");
+        // Includes NUL, newlines, tabs, ESC: paths end up in commit messages and terminal output.
+        if part.chars().any(char::is_control) {
+            bail!("path must not contain control characters");
         }
         parts.push(part);
     }
@@ -130,6 +131,9 @@ mod tests {
     fn normalize_ok() {
         assert_eq!(normalize_path("/env/dev/url").unwrap(), "/env/dev/url");
         assert_eq!(normalize_path("/env//dev/").unwrap(), "/env/dev");
+        for bad in ["/a\nb", "/a\0b", "/a\tb", "/a\x1b[31mb", "/a\u{85}b"] {
+            assert!(normalize_path(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
