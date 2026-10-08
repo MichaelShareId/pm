@@ -32,6 +32,16 @@ struct Cli {
     )]
     session_ttl: u64,
 
+    /// Hard session limit in seconds from the Touch ID unlock; use can't extend past it
+    /// (0 = no limit; env: PM_SESSION_MAX)
+    #[arg(
+        long = "session-max",
+        global = true,
+        env = "PM_SESSION_MAX",
+        default_value_t = session::DEFAULT_SESSION_MAX_SECS
+    )]
+    session_max: u64,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -114,26 +124,29 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let ttl = cli.session_ttl;
+    let policy = session::Policy {
+        ttl: cli.session_ttl,
+        max: cli.session_max,
+    };
     match cli.command {
-        Commands::Init => cmd_init(ttl),
-        Commands::Set { path, raw } => cmd_set(&path, raw, ttl),
-        Commands::Get { path, output } => cmd_get(&path, output, ttl),
+        Commands::Init => cmd_init(policy),
+        Commands::Set { path, raw } => cmd_set(&path, raw, policy),
+        Commands::Get { path, output } => cmd_get(&path, output, policy),
         Commands::Inject {
             prefix,
             mask,
             command,
-        } => cmd_inject(prefix.as_deref(), mask.as_deref(), &command, ttl),
-        Commands::Dump { prefix, mask } => cmd_dump(prefix.as_deref(), mask.as_deref(), ttl),
+        } => cmd_inject(prefix.as_deref(), mask.as_deref(), &command, policy),
+        Commands::Dump { prefix, mask } => cmd_dump(prefix.as_deref(), mask.as_deref(), policy),
         Commands::List { prefix, path } => cmd_list(prefix.as_deref(), path.as_deref()),
-        Commands::Rm { path } => cmd_rm(&path, ttl),
-        Commands::Unlock => cmd_unlock(ttl),
+        Commands::Rm { path } => cmd_rm(&path, policy),
+        Commands::Unlock => cmd_unlock(policy),
         Commands::Lock => cmd_lock(),
-        Commands::Status => cmd_status(ttl),
+        Commands::Status => cmd_status(policy),
     }
 }
 
-fn cmd_init(ttl: u64) -> Result<()> {
+fn cmd_init(policy: session::Policy) -> Result<()> {
     let data = DataDir::resolve()?;
     if data.keys_db().exists() {
         bail!("already initialized: {}", data.root().display());
@@ -156,7 +169,7 @@ fn cmd_init(ttl: u64) -> Result<()> {
             key
         }
     };
-    session::save(&data, &key, ttl)?;
+    session::save(&data, &key, policy)?;
 
     drop(Store::open(&data)?);
     gitutil::init_repo(&data)?;
@@ -166,28 +179,28 @@ fn cmd_init(ttl: u64) -> Result<()> {
     Ok(())
 }
 
-fn unlock_key(data: &DataDir, reason: &str, ttl: u64) -> Result<MasterKey> {
-    if let Some(key) = session::load(data)? {
-        session::touch(data, &key, ttl)?;
-        return Ok(key);
+fn unlock_key(data: &DataDir, reason: &str, policy: session::Policy) -> Result<MasterKey> {
+    if let Some(session) = session::load(data, policy)? {
+        session::touch(data, &session, policy)?;
+        return Ok(session.key);
     }
 
     ensure_touch_id(reason)?;
     let key = load_master_key(data)?;
-    session::save(data, &key, ttl)?;
+    session::save(data, &key, policy)?;
     Ok(key)
 }
 
-fn cmd_unlock(ttl: u64) -> Result<()> {
+fn cmd_unlock(policy: session::Policy) -> Result<()> {
     let data = DataDir::resolve()?;
     data.require_initialized()?;
-    if ttl == 0 {
+    if policy.ttl == 0 {
         bail!("session caching disabled (set PM_SESSION_TTL or --session-ttl > 0)");
     }
     ensure_touch_id("pm: unlock")?;
     let key = load_master_key(&data)?;
-    session::save(&data, &key, ttl)?;
-    println!("{}", session::status_message(&data, ttl)?);
+    session::save(&data, &key, policy)?;
+    println!("{}", session::status_message(&data, policy)?);
     Ok(())
 }
 
@@ -199,20 +212,20 @@ fn cmd_lock() -> Result<()> {
     Ok(())
 }
 
-fn cmd_status(ttl: u64) -> Result<()> {
+fn cmd_status(policy: session::Policy) -> Result<()> {
     let data = DataDir::resolve()?;
     data.require_initialized()?;
-    println!("{}", session::status_message(&data, ttl)?);
+    println!("{}", session::status_message(&data, policy)?);
     Ok(())
 }
 
-fn cmd_set(path: &str, raw: bool, ttl: u64) -> Result<()> {
+fn cmd_set(path: &str, raw: bool, policy: session::Policy) -> Result<()> {
     let path = normalize_path(path)?;
     let data = DataDir::resolve()?;
     data.require_initialized()?;
 
     let value = read_secret_value(raw)?;
-    let key = unlock_key(&data, &format!("pm: set {path}"), ttl)?;
+    let key = unlock_key(&data, &format!("pm: set {path}"), policy)?;
     let (nonce, ciphertext) = encrypt(&key, path.as_bytes(), value.as_bytes())?;
 
     let store = Store::open(&data)?;
@@ -224,7 +237,7 @@ fn cmd_set(path: &str, raw: bool, ttl: u64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_get(path: &str, output: Output, ttl: u64) -> Result<()> {
+fn cmd_get(path: &str, output: Output, policy: session::Policy) -> Result<()> {
     let path = normalize_path(path)?;
     let data = DataDir::resolve()?;
     data.require_initialized()?;
@@ -234,7 +247,7 @@ fn cmd_get(path: &str, output: Output, ttl: u64) -> Result<()> {
         .get(&path)?
         .with_context(|| format!("key not found: {path}"))?;
 
-    let key = unlock_key(&data, &format!("pm: get {path}"), ttl)?;
+    let key = unlock_key(&data, &format!("pm: get {path}"), policy)?;
     let plaintext = decrypt(&key, path.as_bytes(), &row.nonce, &row.ciphertext)?;
     // Output exactly what was stored; quotes were already handled by `set`.
     let text = Zeroizing::new(
@@ -274,7 +287,7 @@ fn load_env_pairs(
     prefix: Option<&str>,
     mask: Option<&str>,
     reason_verb: &str,
-    ttl: u64,
+    policy: session::Policy,
 ) -> Result<Vec<(String, Zeroizing<String>)>> {
     let prefix = prefix.map(normalize_path).transpose()?;
     let env_mask = resolve_env_mask(prefix.as_deref(), mask)?;
@@ -297,7 +310,7 @@ fn load_env_pairs(
         Some(prefix) => format!("pm: {reason_verb} {prefix}"),
         None => format!("pm: {reason_verb}"),
     };
-    let key = unlock_key(&data, &reason, ttl)?;
+    let key = unlock_key(&data, &reason, policy)?;
     let mut envs: Vec<(String, Zeroizing<String>)> = Vec::with_capacity(rows.len());
 
     for row in rows {
@@ -312,7 +325,12 @@ fn load_env_pairs(
     Ok(envs)
 }
 
-fn cmd_inject(prefix: Option<&str>, mask: Option<&str>, command: &[String], ttl: u64) -> Result<()> {
+fn cmd_inject(
+    prefix: Option<&str>,
+    mask: Option<&str>,
+    command: &[String],
+    policy: session::Policy,
+) -> Result<()> {
     if command.is_empty() {
         bail!("missing command; usage: pm inject [--prefix <prefix>] [--mask <prefix>] -- <cmd> [args...]");
     }
@@ -326,7 +344,7 @@ fn cmd_inject(prefix: Option<&str>, mask: Option<&str>, command: &[String], ttl:
         (&command[0], &command[1..])
     };
 
-    let envs = load_env_pairs(prefix, mask, "inject", ttl)?;
+    let envs = load_env_pairs(prefix, mask, "inject", policy)?;
 
     let mut child = Command::new(prog);
     child
@@ -348,8 +366,8 @@ fn cmd_inject(prefix: Option<&str>, mask: Option<&str>, command: &[String], ttl:
     Ok(())
 }
 
-fn cmd_dump(prefix: Option<&str>, mask: Option<&str>, ttl: u64) -> Result<()> {
-    let envs = load_env_pairs(prefix, mask, "dump", ttl)?;
+fn cmd_dump(prefix: Option<&str>, mask: Option<&str>, policy: session::Policy) -> Result<()> {
+    let envs = load_env_pairs(prefix, mask, "dump", policy)?;
     let mut out = io::stdout().lock();
     for (name, value) in &envs {
         writeln!(out, "{}={}", name, value.as_str())?;
@@ -387,12 +405,12 @@ fn cmd_list(prefix: Option<&str>, path: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_rm(path: &str, ttl: u64) -> Result<()> {
+fn cmd_rm(path: &str, policy: session::Policy) -> Result<()> {
     let path = normalize_path(path)?;
     let data = DataDir::resolve()?;
     data.require_initialized()?;
 
-    let _key = unlock_key(&data, &format!("pm: rm {path}"), ttl)?;
+    let _key = unlock_key(&data, &format!("pm: rm {path}"), policy)?;
 
     let store = Store::open(&data)?;
     let _lock = store.write_lock()?;

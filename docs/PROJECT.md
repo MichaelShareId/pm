@@ -55,6 +55,7 @@ Binary: `target/release/pm` (crate name `pm`, edition 2021).
 **Global option**
 
 - `--session-ttl <secs>` (also `PM_SESSION_TTL`), default **180**, `0` = no cache
+- `--session-max <secs>` (also `PM_SESSION_MAX`), default **900**, `0` = no hard limit
 
 **Env**
 
@@ -62,6 +63,7 @@ Binary: `target/release/pm` (crate name `pm`, edition 2021).
 |-----|---------|
 | `PM_DATA` | Vault directory (required) |
 | `PM_SESSION_TTL` | Session TTL seconds (default 180) |
+| `PM_SESSION_MAX` | Hard session limit seconds from unlock (default 900, `0` = none) |
 
 ---
 
@@ -112,12 +114,15 @@ Only ciphertext on disk. WAL mode enabled.
 Plaintext format (owner-only file):
 
 ```
-v1
+v2
 <expires_unix_secs>
+<unlocked_at_unix_secs>
 <master_key_hex>
 ```
 
-- Sliding TTL: each successful use via session extends expiry by TTL from *now*.
+- Sliding TTL: each successful use via session extends expiry by TTL from *now*,
+  capped at `unlocked_at + PM_SESSION_MAX`, so constant use can't keep it unlocked forever.
+- Older `v1` files are discarded (one extra Touch ID prompt).
 - Corrupt / expired → delete and require Touch ID again.
 
 ### Git
@@ -156,7 +161,7 @@ v1
 ### Session cache tradeoff
 
 - Cross-process convenience: master key sits on disk under `PM_DATA` for TTL seconds.
-- Mitigations: `0600`, gitignored, short TTL, `pm lock`, TTL=`0`.
+- Mitigations: `0600`, gitignored, short TTL, hard max lifetime, `pm lock`, TTL=`0`.
 - Not as strong as an in-memory agent; acceptable for the stated 3‑minute UX.
 
 ### Other notes
@@ -192,7 +197,7 @@ Dependencies (high level): `clap`, `rusqlite` (bundled), `fs4`, `chacha20poly130
 | DB | Single SQLite file (`keys.db`) |
 | Cipher | XChaCha20-Poly1305, AAD = path |
 | Auth UX | Touch ID (LA) before Keychain master-key use |
-| Session | File-backed sliding TTL (default 180s), configurable |
+| Session | File-backed sliding TTL (default 180s) + hard max (default 900s), configurable |
 | Git | Shell `git`, commit on write |
 | Default data dir | **None** — `PM_DATA` required (no silent `~/.…` default) |
 | Platform | macOS-first (Touch ID); non-macOS Touch ID errors out |

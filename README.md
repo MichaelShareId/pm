@@ -30,19 +30,24 @@ pm init
 ## Session cache
 
 After a successful Touch ID unlock, the master key is cached in `$PM_DATA/.session`
-(mode `0600`) for a sliding TTL (default **180s** / 3 minutes).
+(mode `0600`) for a sliding TTL (default **180s** / 3 minutes), capped by a hard limit
+from the unlock (default **900s** / 15 minutes).
 
 ```bash
 # configure TTL (seconds); 0 = Touch ID every time
 export PM_SESSION_TTL=180
 pm --session-ttl 300 get /env/dev/url   # per-invocation override
+# hard limit (seconds) from the Touch ID unlock; 0 = no limit
+export PM_SESSION_MAX=900
 
 pm unlock    # Touch ID once, start/refresh session
 pm status    # locked / unlocked + remaining seconds
 pm lock      # clear session now
 ```
 
-Each `get` / `set` / `inject` / `rm` that hits a valid session extends the TTL again.
+Each `get` / `set` / `inject` / `dump` / `rm` that hits a valid session extends the TTL
+again, but never past the hard limit: after it, Touch ID is required no matter how often
+the vault is used.
 
 ## Commands
 

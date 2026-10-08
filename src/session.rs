@@ -9,8 +9,10 @@ use zeroize::Zeroizing;
 use crate::config::DataDir;
 use crate::crypto::{master_key_from_hex, master_key_to_hex, MasterKey};
 
-/// Default unlocked-session lifetime (3 minutes).
+/// Default idle timeout of an unlocked session (3 minutes).
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 180;
+/// Default hard limit of an unlocked session from its Touch ID unlock (15 minutes).
+pub const DEFAULT_SESSION_MAX_SECS: u64 = 900;
 
 pub fn clear(data: &DataDir) -> Result<()> {
     let path = data.session_file();
@@ -21,7 +23,32 @@ pub fn clear(data: &DataDir) -> Result<()> {
     Ok(())
 }
 
-pub fn load(data: &DataDir) -> Result<Option<MasterKey>> {
+/// How long an unlocked session lives.
+#[derive(Debug, Clone, Copy)]
+pub struct Policy {
+    /// Sliding idle timeout: each use extends expiry to `now + ttl`. `0` disables caching.
+    pub ttl: u64,
+    /// Hard limit from the Touch ID unlock that sliding can never pass. `0` = no limit.
+    pub max: u64,
+}
+
+impl Policy {
+    fn deadline(&self, unlocked_at: u64) -> u64 {
+        if self.max == 0 {
+            u64::MAX
+        } else {
+            unlocked_at.saturating_add(self.max)
+        }
+    }
+}
+
+/// An unlocked session: the master key plus when Touch ID last unlocked it.
+pub struct Session {
+    pub key: MasterKey,
+    unlocked_at: u64,
+}
+
+pub fn load(data: &DataDir, policy: Policy) -> Result<Option<Session>> {
     let path = data.session_file();
     if !path.exists() {
         return Ok(None);
@@ -35,39 +62,21 @@ pub fn load(data: &DataDir) -> Result<Option<MasterKey>> {
         }
     };
 
-    let mut lines = raw.lines();
-    let Some(version) = lines.next() else {
-        let _ = clear(data);
-        return Ok(None);
-    };
-    if version != "v1" {
-        let _ = clear(data);
-        return Ok(None);
-    }
-    let Some(expires_s) = lines.next() else {
-        let _ = clear(data);
-        return Ok(None);
-    };
-    let Some(hex) = lines.next() else {
+    // Older formats (v1 had no unlock time) are dropped: one extra Touch ID prompt.
+    let parsed = parse(&raw);
+    let Some((expires, unlocked_at, hex)) = parsed else {
         let _ = clear(data);
         return Ok(None);
     };
 
-    let expires: u64 = match expires_s.parse() {
-        Ok(n) => n,
-        Err(_) => {
-            let _ = clear(data);
-            return Ok(None);
-        }
-    };
-
-    if now_secs()? >= expires {
+    let now = now_secs()?;
+    if now >= expires || now >= policy.deadline(unlocked_at) {
         let _ = clear(data);
         return Ok(None);
     }
 
     match master_key_from_hex(hex) {
-        Ok(key) => Ok(Some(key)),
+        Ok(key) => Ok(Some(Session { key, unlocked_at })),
         Err(_) => {
             let _ = clear(data);
             Ok(None)
@@ -75,9 +84,34 @@ pub fn load(data: &DataDir) -> Result<Option<MasterKey>> {
     }
 }
 
-/// Persist master key until `now + ttl`. No-op when `ttl == 0`.
-pub fn save(data: &DataDir, key: &MasterKey, ttl_secs: u64) -> Result<()> {
-    if ttl_secs == 0 {
+/// `v2\n<expires>\n<unlocked_at>\n<key hex>`
+fn parse(raw: &str) -> Option<(u64, u64, &str)> {
+    let mut lines = raw.lines();
+    if lines.next()? != "v2" {
+        return None;
+    }
+    let expires = lines.next()?.parse().ok()?;
+    let unlocked_at = lines.next()?.parse().ok()?;
+    let hex = lines.next()?;
+    Some((expires, unlocked_at, hex))
+}
+
+/// Start a new session right after a Touch ID unlock. No-op (clears) when `ttl == 0`.
+pub fn save(data: &DataDir, key: &MasterKey, policy: Policy) -> Result<()> {
+    write(data, key, now_secs()?, policy)
+}
+
+/// Sliding refresh: extend expiry from now, capped at the session's hard limit.
+pub fn touch(data: &DataDir, session: &Session, policy: Policy) -> Result<()> {
+    write(data, &session.key, session.unlocked_at, policy)
+}
+
+fn write(data: &DataDir, key: &MasterKey, unlocked_at: u64, policy: Policy) -> Result<()> {
+    let now = now_secs()?;
+    let expires = now
+        .saturating_add(policy.ttl)
+        .min(policy.deadline(unlocked_at));
+    if policy.ttl == 0 || expires <= now {
         clear(data)?;
         return Ok(());
     }
@@ -85,9 +119,8 @@ pub fn save(data: &DataDir, key: &MasterKey, ttl_secs: u64) -> Result<()> {
     data.ensure_dir()?;
     crate::gitutil::ensure_gitignore(data)?;
     let path = data.session_file();
-    let expires = now_secs()? + ttl_secs;
     let hex = Zeroizing::new(master_key_to_hex(key));
-    let body = Zeroizing::new(format!("v1\n{expires}\n{}\n", hex.as_str()));
+    let body = Zeroizing::new(format!("v2\n{expires}\n{unlocked_at}\n{}\n", hex.as_str()));
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -110,11 +143,6 @@ pub fn save(data: &DataDir, key: &MasterKey, ttl_secs: u64) -> Result<()> {
     Ok(())
 }
 
-/// Sliding refresh: extend expiry from now if a valid session already exists.
-pub fn touch(data: &DataDir, key: &MasterKey, ttl_secs: u64) -> Result<()> {
-    save(data, key, ttl_secs)
-}
-
 fn now_secs() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -122,21 +150,15 @@ fn now_secs() -> Result<u64> {
         .as_secs())
 }
 
-#[allow(dead_code)]
 pub fn remaining_secs(data: &DataDir) -> Result<Option<u64>> {
     let path = data.session_file();
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path)?;
-    let mut lines = raw.lines();
-    if lines.next() != Some("v1") {
+    let raw = Zeroizing::new(fs::read_to_string(&path)?);
+    let Some((expires, _, _)) = parse(&raw) else {
         return Ok(None);
-    }
-    let expires: u64 = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("bad session"))?
-        .parse()?;
+    };
     let now = now_secs()?;
     if now >= expires {
         return Ok(None);
@@ -144,13 +166,16 @@ pub fn remaining_secs(data: &DataDir) -> Result<Option<u64>> {
     Ok(Some(expires - now))
 }
 
-pub fn status_message(data: &DataDir, ttl_secs: u64) -> Result<String> {
-    if ttl_secs == 0 {
+pub fn status_message(data: &DataDir, policy: Policy) -> Result<String> {
+    if policy.ttl == 0 {
         return Ok("session caching disabled (PM_SESSION_TTL=0)".into());
     }
     match remaining_secs(data)? {
-        Some(left) => Ok(format!("unlocked (~{left}s remaining, ttl={ttl_secs}s)")),
-        None => Ok(format!("locked (ttl={ttl_secs}s)")),
+        Some(left) => Ok(format!(
+            "unlocked (~{left}s remaining, ttl={}s, max={}s)",
+            policy.ttl, policy.max
+        )),
+        None => Ok(format!("locked (ttl={}s, max={}s)", policy.ttl, policy.max)),
     }
 }
 
@@ -159,23 +184,46 @@ mod tests {
     use super::*;
     use crate::crypto::generate_master_key;
 
-    fn tmp_data() -> DataDir {
-        let dir = std::env::temp_dir().join(format!("pm-session-test-{}", std::process::id()));
+    fn tmp_data(name: &str) -> DataDir {
+        let dir = std::env::temp_dir()
+            .join(format!("pm-session-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         // DataDir only wraps a path; construct via PM_DATA in real code — use a test helper.
         DataDir::from_path(dir)
     }
 
+    const POLICY: Policy = Policy { ttl: 60, max: 900 };
+
     #[test]
     fn roundtrip_and_expiry() {
-        let data = tmp_data();
+        let data = tmp_data("roundtrip");
         let key = generate_master_key();
-        save(&data, &key, 60).unwrap();
-        let loaded = load(&data).unwrap().expect("session present");
-        assert_eq!(master_key_to_hex(&loaded), master_key_to_hex(&key));
+        save(&data, &key, POLICY).unwrap();
+        let loaded = load(&data, POLICY).unwrap().expect("session present");
+        assert_eq!(master_key_to_hex(&loaded.key), master_key_to_hex(&key));
         clear(&data).unwrap();
-        assert!(load(&data).unwrap().is_none());
+        assert!(load(&data, POLICY).unwrap().is_none());
+        let _ = fs::remove_dir_all(data.root());
+    }
+
+    #[test]
+    fn sliding_never_passes_hard_limit() {
+        let data = tmp_data("limit");
+        let key = generate_master_key();
+        let now = now_secs().unwrap();
+
+        // Unlocked 850s ago with max 900: touching may only extend to the 900s deadline.
+        let session = Session { key, unlocked_at: now - 850 };
+        touch(&data, &session, POLICY).unwrap();
+        let left = remaining_secs(&data).unwrap().expect("still unlocked");
+        assert!(left <= 50, "expiry extended past hard limit: {left}s left");
+
+        // Past the hard limit: the session is gone, whatever its expiry says.
+        let body = format!("v2\n{}\n{}\n{}\n", now + 60, now - 901, "00".repeat(32));
+        fs::write(data.session_file(), body).unwrap();
+        assert!(load(&data, POLICY).unwrap().is_none());
+        assert!(!data.session_file().exists());
         let _ = fs::remove_dir_all(data.root());
     }
 }
