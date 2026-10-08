@@ -7,6 +7,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::DataDir;
 
+/// Segment-exact, case-sensitive prefix match: `/env/dev` (?1) matches `/env/dev` and
+/// `/env/dev/...` (?2 = `/env/dev/`). Not `LIKE`: it treats `_`/`%` as wildcards and
+/// ignores ASCII case, so `/env/my_app` would also match `/env/myXapp/...`.
+const PREFIX_MATCH: &str = "path = ?1 OR substr(path, 1, length(?2)) = ?2";
+
 pub struct Store {
     conn: Connection,
     lock_path: std::path::PathBuf,
@@ -119,15 +124,11 @@ impl Store {
     }
 
     pub fn list_prefix(&self, prefix: &str) -> Result<Vec<SecretRow>> {
-        // Exact prefix match on path segments: `/env/dev` matches `/env/dev` and `/env/dev/...`
-        let like = format!("{prefix}/%");
-        let mut stmt = self.conn.prepare(
-            "SELECT path, nonce, ciphertext FROM secrets
-             WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'
-             ORDER BY path",
-        )?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT path, nonce, ciphertext FROM secrets WHERE {PREFIX_MATCH} ORDER BY path"
+        ))?;
         let rows = stmt
-            .query_map(params![prefix, like], |row| {
+            .query_map(params![prefix, format!("{prefix}/")], |row| {
                 Ok(SecretRow {
                     path: row.get(0)?,
                     nonce: row.get(1)?,
@@ -150,14 +151,11 @@ impl Store {
                 Ok(rows)
             }
             Some(prefix) => {
-                let like = format!("{prefix}/%");
-                let mut stmt = self.conn.prepare(
-                    "SELECT path FROM secrets
-                     WHERE path = ?1 OR path LIKE ?2
-                     ORDER BY path",
-                )?;
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT path FROM secrets WHERE {PREFIX_MATCH} ORDER BY path"
+                ))?;
                 let rows = stmt
-                    .query_map(params![prefix, like], |row| row.get(0))?
+                    .query_map(params![prefix, format!("{prefix}/")], |row| row.get(0))?
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(rows)
             }
@@ -230,6 +228,37 @@ mod tests {
         };
         assert_eq!(git(&["log", "--format=%s"]), "set /a\ninit\n");
         assert_eq!(git(&["status", "--porcelain"]), "");
+        let _ = std::fs::remove_dir_all(data.root());
+    }
+
+    #[test]
+    fn prefix_match_is_exact() {
+        let data = tmp_data("prefix");
+        let store = Store::open(&data).unwrap();
+        for path in [
+            "/env/my_app",
+            "/env/my_app/key",
+            "/env/myXapp/key",
+            "/env/MY_APP/key",
+            "/env/my_apps/key",
+            "/env/100%/key",
+            "/env/100x/key",
+        ] {
+            store.upsert(path, b"n", b"c").unwrap();
+        }
+
+        assert_eq!(
+            store.list_paths(Some("/env/my_app")).unwrap(),
+            vec!["/env/my_app", "/env/my_app/key"]
+        );
+        let rows: Vec<String> = store
+            .list_prefix("/env/my_app")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(rows, vec!["/env/my_app", "/env/my_app/key"]);
+        assert_eq!(store.list_paths(Some("/env/100%")).unwrap(), vec!["/env/100%/key"]);
         let _ = std::fs::remove_dir_all(data.root());
     }
 }
