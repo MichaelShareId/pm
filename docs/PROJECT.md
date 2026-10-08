@@ -45,7 +45,7 @@ Binary: `target/release/pm` (crate name `pm`, edition 2021).
 | `pm set <path>` | Value from stdin, or hidden TTY prompt; encrypt + upsert + git commit |
 | `pm get [-o stdout\|clipboard] <path>` | Decrypt; default stdout; optional clipboard |
 | `pm inject [--prefix <prefix>] [--mask <prefix>] -- <cmd>…` | Decrypt all keys under prefix; inject as env; run command. Without `--mask`, keeps last prefix segment. |
-| `pm dump [--prefix <prefix>] [--mask <prefix>]` | Decrypt matching keys; print `NAME=value` (dotenv). Same naming as inject. |
+| `pm dump [--prefix <prefix>] [--mask <prefix>]` | Decrypt matching keys; print `NAME='value'` (dotenv, single-quoted). Values with `'` or a line break are refused. Same naming as inject. |
 | `pm list [--prefix <prefix>] [path]` | List paths, or env names that `--prefix` would inject |
 | `pm rm <path>` | Delete + git commit (Touch ID / session) |
 | `pm unlock` | Touch ID → write session cache |

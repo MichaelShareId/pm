@@ -369,8 +369,13 @@ fn cmd_inject(
 fn cmd_dump(prefix: Option<&str>, mask: Option<&str>, policy: session::Policy) -> Result<()> {
     let envs = load_env_pairs(prefix, mask, "dump", policy)?;
     let mut out = io::stdout().lock();
+    // Quote everything first so a bad value fails before any secret is printed.
+    let mut lines = Vec::with_capacity(envs.len());
     for (name, value) in &envs {
-        writeln!(out, "{}={}", name, value.as_str())?;
+        lines.push(Zeroizing::new(format!("{name}={}", dotenv_quote(name, value)?)));
+    }
+    for line in &lines {
+        writeln!(out, "{}", line.as_str())?;
     }
     out.flush()?;
     Ok(())
@@ -421,6 +426,16 @@ fn cmd_rm(path: &str, policy: session::Policy) -> Result<()> {
     }
     commit_db(&data, &format!("rm {path}"))?;
     Ok(())
+}
+
+/// Single-quote a value for dotenv files and `set -a; . file` in shells: inside `'...'`
+/// nothing is expanded, so `$`, `#`, spaces and `"` are kept as is. A `'` or line break
+/// can't be written there without parser-specific escapes, so such values are refused.
+fn dotenv_quote(name: &str, value: &str) -> Result<String> {
+    if value.contains(['\'', '\n', '\r']) {
+        bail!("{name}: value contains a `'` or line break and can't be written safely as dotenv; use `pm inject` or `pm get`");
+    }
+    Ok(format!("'{value}'"))
 }
 
 /// Drop a single matching pair of surrounding `'` or `"` (common when pasting .env values).
@@ -475,7 +490,7 @@ fn prepare_value(input: &str, raw_value: bool) -> Result<Zeroizing<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{prepare_value, strip_surrounding_quotes};
+    use super::{dotenv_quote, prepare_value, strip_surrounding_quotes};
 
     #[test]
     fn strips_matching_quotes() {
@@ -492,5 +507,13 @@ mod tests {
         assert_eq!(prepare_value(r#""'abc'""#, false).unwrap().as_str(), "'abc'");
         assert_eq!(prepare_value(r#""abc""#, true).unwrap().as_str(), r#""abc""#);
         assert!(prepare_value(r#""""#, false).is_err());
+    }
+
+    #[test]
+    fn dotenv_values_are_single_quoted() {
+        assert_eq!(dotenv_quote("A", "p@ss word#$HOME\"x").unwrap(), "'p@ss word#$HOME\"x'");
+        assert!(dotenv_quote("A", "it's").is_err());
+        assert!(dotenv_quote("A", "x\nOTHER=y").is_err());
+        assert!(dotenv_quote("A", "x\r").is_err());
     }
 }
