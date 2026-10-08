@@ -164,6 +164,8 @@ fn cmd_init(policy: session::Policy) -> Result<()> {
     }
 
     data.ensure_dir()?;
+    // Now that the directory exists, resolve again to get its canonical path.
+    let data = DataDir::resolve()?;
 
     // keys.db marks the vault as initialized, so create it only after auth and the
     // master key succeed; otherwise a cancelled Touch ID leaves a vault with no key.

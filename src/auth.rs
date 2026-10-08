@@ -10,7 +10,11 @@ const SERVICE: &str = "pm.master-key";
 
 fn account_for(data: &DataDir) -> String {
     // Scope the keychain item to this vault path so multiple PM_DATA dirs can coexist.
-    format!("pm:{}", data.root().display())
+    account_for_path(data.root())
+}
+
+fn account_for_path(path: &std::path::Path) -> String {
+    format!("pm:{}", path.display())
 }
 
 pub fn store_master_key(data: &DataDir, key: &MasterKey) -> Result<()> {
@@ -28,8 +32,25 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 /// Load this vault's master key; `Ok(None)` only when no Keychain item exists.
 /// Other errors (e.g. a denied access prompt) are returned, never treated as "missing".
 pub fn load_existing_master_key(data: &DataDir) -> Result<Option<MasterKey>> {
-    let account = account_for(data);
-    match get_generic_password(SERVICE, &account) {
+    if let Some(key) = load_from_account(&account_for(data))? {
+        return Ok(Some(key));
+    }
+    // Older builds named the item after PM_DATA as typed (e.g. `./vault`, `vault/`).
+    // Move such a key to the canonical account once.
+    let legacy = account_for_path(data.as_given());
+    if legacy == account_for(data) {
+        return Ok(None);
+    }
+    let Some(key) = load_from_account(&legacy)? else {
+        return Ok(None);
+    };
+    store_master_key(data, &key)?;
+    let _ = delete_generic_password(SERVICE, &legacy);
+    Ok(Some(key))
+}
+
+fn load_from_account(account: &str) -> Result<Option<MasterKey>> {
+    match get_generic_password(SERVICE, account) {
         Ok(bytes) => {
             let s = std::str::from_utf8(&bytes).context("master key in Keychain is not UTF-8")?;
             master_key_from_hex(s).map(Some)
