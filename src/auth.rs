@@ -98,9 +98,11 @@ pub fn ensure_touch_id(reason: &str) -> Result<()> {
             Err("authentication failed".to_string())
         } else {
             // SAFETY: LA framework passes a valid NSError when success is false.
-            let err =
-                unsafe { Retained::retain(error) }.expect("NSError from LocalAuthentication");
-            Err(err.localizedDescription().to_string())
+            // No panics here: unwinding out of an Objective-C callback aborts the process.
+            match unsafe { Retained::retain(error) } {
+                Some(err) => Err(err.localizedDescription().to_string()),
+                None => Err("authentication failed".to_string()),
+            }
         };
         let _ = tx.send(result);
     });
