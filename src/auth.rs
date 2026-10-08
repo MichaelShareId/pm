@@ -4,7 +4,7 @@ use security_framework::passwords::{
 };
 
 use crate::config::DataDir;
-use crate::crypto::{generate_master_key, master_key_from_hex, master_key_to_hex, MasterKey};
+use crate::crypto::{master_key_from_hex, master_key_to_hex, MasterKey};
 
 const SERVICE: &str = "pm.master-key";
 
@@ -22,20 +22,25 @@ pub fn store_master_key(data: &DataDir, key: &MasterKey) -> Result<()> {
     Ok(())
 }
 
-pub fn load_or_create_master_key(data: &DataDir, create_if_missing: bool) -> Result<MasterKey> {
+/// Keychain `errSecItemNotFound`.
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+/// Load this vault's master key; `Ok(None)` only when no Keychain item exists.
+/// Other errors (e.g. a denied access prompt) are returned, never treated as "missing".
+pub fn load_existing_master_key(data: &DataDir) -> Result<Option<MasterKey>> {
     let account = account_for(data);
     match get_generic_password(SERVICE, &account) {
         Ok(bytes) => {
             let s = std::str::from_utf8(&bytes).context("master key in Keychain is not UTF-8")?;
-            master_key_from_hex(s)
+            master_key_from_hex(s).map(Some)
         }
-        Err(_) if create_if_missing => {
-            let key = generate_master_key();
-            store_master_key(data, &key)?;
-            Ok(key)
-        }
+        Err(err) if err.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
         Err(err) => Err(err).context("load master key from macOS Keychain"),
     }
+}
+
+pub fn load_master_key(data: &DataDir) -> Result<MasterKey> {
+    load_existing_master_key(data)?.context("master key not found in macOS Keychain")
 }
 
 #[cfg(target_os = "macos")]

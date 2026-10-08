@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroizing;
 
-use crate::auth::{ensure_touch_id, load_or_create_master_key, store_master_key};
+use crate::auth::{ensure_touch_id, load_existing_master_key, load_master_key, store_master_key};
 use crate::config::DataDir;
 use crate::crypto::{decrypt, encrypt, generate_master_key, MasterKey};
 use crate::gitutil::commit_db;
@@ -137,15 +137,25 @@ fn cmd_init(ttl: u64) -> Result<()> {
     }
 
     data.ensure_dir()?;
-    let store = Store::open(&data)?;
-    drop(store);
 
+    // keys.db marks the vault as initialized, so create it only after auth and the
+    // master key succeed; otherwise a cancelled Touch ID leaves a vault with no key.
     ensure_touch_id("pm: confirm Touch ID for new vault")?;
-    let key = generate_master_key();
-    store_master_key(&data, &key)?;
-    let loaded = load_or_create_master_key(&data, false)?;
-    session::save(&data, &loaded, ttl)?;
+    let key = match load_existing_master_key(&data)? {
+        // Left by an earlier init of this PM_DATA: reuse it so old git history stays decryptable.
+        Some(key) => {
+            eprintln!("reusing existing master key from Keychain");
+            key
+        }
+        None => {
+            let key = generate_master_key();
+            store_master_key(&data, &key)?;
+            key
+        }
+    };
+    session::save(&data, &key, ttl)?;
 
+    drop(Store::open(&data)?);
     gitutil::init_repo(&data)?;
     commit_db(&data, "init")?;
 
@@ -160,7 +170,7 @@ fn unlock_key(data: &DataDir, reason: &str, ttl: u64) -> Result<MasterKey> {
     }
 
     ensure_touch_id(reason)?;
-    let key = load_or_create_master_key(data, false)?;
+    let key = load_master_key(data)?;
     session::save(data, &key, ttl)?;
     Ok(key)
 }
@@ -172,7 +182,7 @@ fn cmd_unlock(ttl: u64) -> Result<()> {
         bail!("session caching disabled (set PM_SESSION_TTL or --session-ttl > 0)");
     }
     ensure_touch_id("pm: unlock")?;
-    let key = load_or_create_master_key(&data, false)?;
+    let key = load_master_key(&data)?;
     session::save(&data, &key, ttl)?;
     println!("{}", session::status_message(&data, ttl)?);
     Ok(())
