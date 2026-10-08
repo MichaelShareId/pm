@@ -77,7 +77,7 @@ pm rm /env/dev/url
 ## Storage
 
 ```
-$PM_DATA/
+$PM_DATA/           # mode 0700 (enforced on every command)
   .git/           # every set/rm is a commit
   keys.db         # SQLite: path → nonce + ciphertext
   .lock           # write lock (gitignored)

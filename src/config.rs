@@ -61,9 +61,21 @@ impl DataDir {
         self.root.join(".session")
     }
 
+    /// Create the vault dir owner-only (`0700`), and tighten an existing one that is looser:
+    /// keys.db and .git hold every path name and all ciphertext.
     pub fn ensure_dir(&self) -> Result<()> {
-        fs::create_dir_all(&self.root)
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&self.root)
             .with_context(|| format!("create data dir {}", self.root.display()))?;
+        let mode = fs::metadata(&self.root)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restrict data dir {} to 0700", self.root.display()))?;
+        }
         Ok(())
     }
 
@@ -104,5 +116,22 @@ mod tests {
             assert_eq!(root, vault, "PM_DATA={}", given.display());
         }
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ensure_dir_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = env::temp_dir().join(format!("pm-config-perm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let data = DataDir::from_path(dir.join("new"));
+        data.ensure_dir().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(data.root()), 0o700);
+
+        fs::set_permissions(data.root(), fs::Permissions::from_mode(0o755)).unwrap();
+        data.ensure_dir().unwrap();
+        assert_eq!(mode(data.root()), 0o700);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

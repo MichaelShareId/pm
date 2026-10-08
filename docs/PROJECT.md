@@ -92,7 +92,7 @@ Prefix match for inject/list: exact path **or** paths starting with `{prefix}/`
 ## Storage layout (`$PM_DATA`)
 
 ```
-$PM_DATA/
+$PM_DATA/           # mode 0700 (enforced on every command)
   .git/            # auto-init; commits on set/rm/init
   keys.db          # SQLite secrets
   .lock            # exclusive write lock (fs4); gitignored
