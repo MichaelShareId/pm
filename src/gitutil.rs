@@ -52,7 +52,24 @@ pub fn commit_db(data: &DataDir, message: &str) -> Result<()> {
     if status.success() {
         return Ok(());
     }
-    run_git(data, &["-c", "user.name=pm", "-c", "user.email=pm@local", "commit", "-m", message])?;
+    // Fixed identity, and no signing or hooks: global settings like commit.gpgsign or
+    // core.hooksPath must not prompt, run code, or fail vault commits.
+    run_git(
+        data,
+        &[
+            "-c",
+            "user.name=pm",
+            "-c",
+            "user.email=pm@local",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            message,
+        ],
+    )?;
     Ok(())
 }
 
@@ -68,4 +85,28 @@ fn run_git(data: &DataDir, args: &[&str]) -> Result<()> {
         bail!("git {} failed: {stderr}", args.join(" "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_ignores_hooks_and_signing() {
+        let dir = std::env::temp_dir().join(format!("pm-git-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = DataDir::from_path(dir);
+        init_repo(&data).unwrap();
+        run_git(&data, &["config", "commit.gpgsign", "true"]).unwrap();
+        run_git(&data, &["config", "gpg.program", "false"]).unwrap();
+        let hook = data.root().join(".git/hooks/pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+        std::fs::set_permissions(&hook, mode).unwrap();
+        std::fs::write(data.keys_db(), b"x").unwrap();
+
+        commit_db(&data, "set /a").unwrap();
+        let _ = std::fs::remove_dir_all(data.root());
+    }
 }

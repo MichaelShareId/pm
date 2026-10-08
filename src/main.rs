@@ -184,7 +184,7 @@ fn cmd_init(policy: session::Policy) -> Result<()> {
 
     drop(Store::open(&data)?);
     gitutil::init_repo(&data)?;
-    commit_db(&data, "init")?;
+    commit_or_warn(&data, "init");
 
     println!("initialized {}", data.root().display());
     Ok(())
@@ -240,11 +240,10 @@ fn cmd_set(path: &str, raw: bool, policy: session::Policy) -> Result<()> {
     let (nonce, ciphertext) = encrypt(&key, path.as_bytes(), value.as_bytes())?;
 
     let store = Store::open(&data)?;
+    // Hold the lock through the commit so concurrent writers can't race on git.
     let _lock = store.write_lock()?;
     store.upsert(&path, &nonce, &ciphertext)?;
-    drop(_lock);
-
-    commit_db(&data, &format!("set {path}"))?;
+    commit_or_warn(&data, &format!("set {path}"));
     Ok(())
 }
 
@@ -448,13 +447,19 @@ fn cmd_rm(path: &str, policy: session::Policy) -> Result<()> {
 
     let store = Store::open(&data)?;
     let _lock = store.write_lock()?;
-    let removed = store.delete(&path)?;
-    drop(_lock);
-    if !removed {
+    if !store.delete(&path)? {
         bail!("key not found: {path}");
     }
-    commit_db(&data, &format!("rm {path}"))?;
+    commit_or_warn(&data, &format!("rm {path}"));
     Ok(())
+}
+
+/// The change is already saved in keys.db; a failed commit only loses history, so warn
+/// instead of reporting the command as failed. The next successful commit includes it.
+fn commit_or_warn(data: &DataDir, message: &str) {
+    if let Err(err) = commit_db(data, message) {
+        eprintln!("warning: change saved, but git commit failed (included in the next commit): {err:#}");
+    }
 }
 
 /// Single-quote a value for dotenv files and `set -a; . file` in shells: inside `'...'`
