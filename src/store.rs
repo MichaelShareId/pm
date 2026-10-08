@@ -38,6 +38,9 @@ impl Store {
             -- Rollback journal: commits land in keys.db itself, so git sees them.
             -- (WAL would leave changes in keys.db-wal until the connection closes.)
             PRAGMA journal_mode=DELETE;
+            -- Zero deleted/overwritten content instead of leaving old ciphertext in free
+            -- pages of keys.db (and so in every later git snapshot).
+            PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS secrets (
                 path TEXT PRIMARY KEY NOT NULL,
                 nonce BLOB NOT NULL,
@@ -259,6 +262,24 @@ mod tests {
             .collect();
         assert_eq!(rows, vec!["/env/my_app", "/env/my_app/key"]);
         assert_eq!(store.list_paths(Some("/env/100%")).unwrap(), vec!["/env/100%/key"]);
+        let _ = std::fs::remove_dir_all(data.root());
+    }
+
+    #[test]
+    fn removed_and_overwritten_values_leave_no_trace_in_file() {
+        let data = tmp_data("secure-delete");
+        let store = Store::open(&data).unwrap();
+        store.upsert("/a", b"n", b"OLD-CIPHERTEXT-AAAA").unwrap();
+        store.upsert("/a", b"n", b"NEW-CIPHERTEXT-BBBB").unwrap();
+        store.upsert("/b", b"n", b"GONE-CIPHERTEXT-CCC").unwrap();
+        assert!(store.delete("/b").unwrap());
+        drop(store);
+
+        let bytes = std::fs::read(data.keys_db()).unwrap();
+        let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+        assert!(contains(b"NEW-CIPHERTEXT-BBBB"));
+        assert!(!contains(b"OLD-CIPHERTEXT-AAAA"));
+        assert!(!contains(b"GONE-CIPHERTEXT-CCC"));
         let _ = std::fs::remove_dir_all(data.root());
     }
 }
