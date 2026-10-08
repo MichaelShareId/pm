@@ -64,6 +64,10 @@ enum Commands {
         path: String,
         #[arg(short = 'o', long = "output", value_enum, default_value_t = Output::Stdout)]
         output: Output,
+        /// With `-o clipboard`: clear the clipboard after this many seconds if it still
+        /// holds the secret (0 = never)
+        #[arg(long = "clear-after", env = "PM_CLIPBOARD_CLEAR", default_value_t = 45)]
+        clear_after: u64,
     },
     /// Inject matching secrets as env vars and run a command
     Inject {
@@ -113,6 +117,10 @@ enum Commands {
     Lock,
     /// Show session lock/unlock status
     Status,
+    /// Internal: started by `get -o clipboard`; reads the copied value on stdin, waits,
+    /// then clears the clipboard if it still holds that value
+    #[command(name = "__clipboard-clear", hide = true)]
+    ClipboardClear { secs: u64 },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -137,7 +145,11 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Init => cmd_init(policy),
         Commands::Set { path, raw } => cmd_set(&path, raw, policy),
-        Commands::Get { path, output } => cmd_get(&path, output, policy),
+        Commands::Get {
+            path,
+            output,
+            clear_after,
+        } => cmd_get(&path, output, clear_after, policy),
         Commands::Inject {
             prefix,
             mask,
@@ -154,6 +166,7 @@ fn run() -> Result<()> {
         Commands::Unlock => cmd_unlock(policy),
         Commands::Lock => cmd_lock(),
         Commands::Status => cmd_status(policy),
+        Commands::ClipboardClear { secs } => cmd_clipboard_clear(secs),
     }
 }
 
@@ -249,7 +262,7 @@ fn cmd_set(path: &str, raw: bool, policy: session::Policy) -> Result<()> {
     Ok(())
 }
 
-fn cmd_get(path: &str, output: Output, policy: session::Policy) -> Result<()> {
+fn cmd_get(path: &str, output: Output, clear_after: u64, policy: session::Policy) -> Result<()> {
     let path = normalize_path(path)?;
     let data = DataDir::resolve()?;
     data.require_initialized()?;
@@ -275,12 +288,55 @@ fn cmd_get(path: &str, output: Output, policy: session::Policy) -> Result<()> {
             io::stdout().flush()?;
         }
         Output::Clipboard => {
+            use arboard::SetExtApple;
+
             let mut clipboard = arboard::Clipboard::new().context("open clipboard")?;
+            // Concealed: clipboard managers (Raycast, Alfred, Paste…) skip it.
             clipboard
-                .set_text(text.as_str())
+                .set()
+                .exclude_from_history()
+                .text(text.as_str())
                 .context("copy to clipboard")?;
-            eprintln!("copied {path} to clipboard");
+            if clear_after == 0 {
+                eprintln!("copied {path} to clipboard");
+            } else {
+                spawn_clipboard_clear(&text, clear_after)?;
+                eprintln!("copied {path} to clipboard (clears in {clear_after}s)");
+            }
         }
+    }
+    Ok(())
+}
+
+/// Start a detached `pm __clipboard-clear` that outlives this process. The value goes
+/// through a pipe, never argv (visible to `ps`), so the helper can tell whether the
+/// clipboard still holds it and leave anything copied since alone.
+fn spawn_clipboard_clear(value: &str, secs: u64) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let exe = std::env::current_exe().context("locate pm executable")?;
+    let mut child = Command::new(exe)
+        .args(["__clipboard-clear", &secs.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Own process group: closing the terminal (SIGHUP) or Ctrl-C doesn't kill it.
+        .process_group(0)
+        .spawn()
+        .context("start clipboard clear helper")?;
+    let mut stdin = child.stdin.take().context("clipboard helper stdin")?;
+    stdin.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+fn cmd_clipboard_clear(secs: u64) -> Result<()> {
+    let mut expected = Zeroizing::new(String::new());
+    io::stdin().read_to_string(&mut expected)?;
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+    let mut clipboard = arboard::Clipboard::new().context("open clipboard")?;
+    let current = Zeroizing::new(clipboard.get_text().unwrap_or_default());
+    if *current == *expected {
+        clipboard.clear().context("clear clipboard")?;
     }
     Ok(())
 }

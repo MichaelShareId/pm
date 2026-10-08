@@ -60,7 +60,8 @@ echo -n '"quoted"' | pm set --raw /env/dev/literal
 
 # Read
 pm get /env/dev/url
-pm get -o clipboard /env/dev/url
+pm get -o clipboard /env/dev/url   # hidden from clipboard managers, cleared after 45s
+pm get -o clipboard --clear-after 10 /env/dev/url   # or PM_CLIPBOARD_CLEAR; 0 = never
 
 # Inject matching keys as env vars, then run a command
 # /env/dev/url → DEV_URL (keeps last prefix segment)
