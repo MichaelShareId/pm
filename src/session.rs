@@ -83,7 +83,7 @@ pub fn save(data: &DataDir, key: &MasterKey, ttl_secs: u64) -> Result<()> {
     }
 
     data.ensure_dir()?;
-    ensure_session_gitignored(data)?;
+    crate::gitutil::ensure_gitignore(data)?;
     let path = data.session_file();
     let expires = now_secs()? + ttl_secs;
     let hex = Zeroizing::new(master_key_to_hex(key));
@@ -107,25 +107,6 @@ pub fn save(data: &DataDir, key: &MasterKey, ttl_secs: u64) -> Result<()> {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
 
-    Ok(())
-}
-
-fn ensure_session_gitignored(data: &DataDir) -> Result<()> {
-    let path = data.root().join(".gitignore");
-    let existing = if path.exists() {
-        fs::read_to_string(&path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    if existing.lines().any(|l| l.trim() == ".session") {
-        return Ok(());
-    }
-    let mut out = existing;
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(".session\n");
-    fs::write(&path, out).with_context(|| format!("update {}", path.display()))?;
     Ok(())
 }
 

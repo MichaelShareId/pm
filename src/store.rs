@@ -30,7 +30,9 @@ impl Store {
             .with_context(|| format!("open db {}", db_path.display()))?;
         conn.execute_batch(
             "
-            PRAGMA journal_mode=WAL;
+            -- Rollback journal: commits land in keys.db itself, so git sees them.
+            -- (WAL would leave changes in keys.db-wal until the connection closes.)
+            PRAGMA journal_mode=DELETE;
             CREATE TABLE IF NOT EXISTS secrets (
                 path TEXT PRIMARY KEY NOT NULL,
                 nonce BLOB NOT NULL,
@@ -168,4 +170,66 @@ fn now_secs() -> Result<i64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock before epoch")?
         .as_secs() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_data(name: &str) -> DataDir {
+        let dir = std::env::temp_dir().join(format!("pm-store-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        DataDir::from_path(dir)
+    }
+
+    #[test]
+    fn write_reaches_keys_db_while_store_open() {
+        let data = tmp_data("journal");
+        // Simulate a vault created by an older build that used WAL.
+        let legacy = Connection::open(data.keys_db()).unwrap();
+        legacy.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        drop(legacy);
+
+        let store = Store::open(&data).unwrap();
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+
+        store.upsert("/a", b"n", b"c").unwrap();
+        // Store still open (as when commit_db runs): the change must already be in keys.db.
+        assert!(!data.root().join("keys.db-wal").exists());
+        let other = Connection::open(data.keys_db()).unwrap();
+        let n: i64 = other
+            .query_row("SELECT count(*) FROM secrets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_dir_all(data.root());
+    }
+
+    #[test]
+    fn commit_while_store_open_captures_change() {
+        let data = tmp_data("git");
+        crate::gitutil::init_repo(&data).unwrap();
+        let store = Store::open(&data).unwrap();
+        crate::gitutil::commit_db(&data, "init").unwrap();
+
+        store.upsert("/a", b"n", b"c").unwrap();
+        crate::gitutil::commit_db(&data, "set /a").unwrap();
+
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(data.root())
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        assert_eq!(git(&["log", "--format=%s"]), "set /a\ninit\n");
+        assert_eq!(git(&["status", "--porcelain"]), "");
+        let _ = std::fs::remove_dir_all(data.root());
+    }
 }
