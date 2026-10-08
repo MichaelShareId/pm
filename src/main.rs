@@ -206,9 +206,12 @@ fn cmd_init(policy: session::Policy) -> Result<()> {
 }
 
 fn unlock_key(data: &DataDir, reason: &str, policy: session::Policy) -> Result<MasterKey> {
-    if let Some(session) = session::load(data, policy)? {
-        session::touch(data, &session, policy)?;
-        return Ok(session.key);
+    // TTL 0 means "Touch ID every time": don't use a session left by an earlier run.
+    if policy.ttl > 0 {
+        if let Some(session) = session::load(data, policy)? {
+            session::touch(data, &session, policy)?;
+            return Ok(session.key);
+        }
     }
 
     ensure_touch_id(reason)?;
