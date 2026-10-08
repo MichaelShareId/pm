@@ -88,3 +88,31 @@ $PM_DATA/           # mode 0700 (enforced on every command)
 
 Values are XChaCha20-Poly1305 with AAD = path. The master key is 32 random bytes
 in the Keychain (`pm.master-key` / `pm:$PM_DATA`).
+
+## Security notes
+
+### Git history keeps every old value
+
+Every `set` and `rm` commits a snapshot of `keys.db`, so `rm` and overwrites don't erase
+anything from history: each value ever stored stays in `.git` as ciphertext, and commit
+messages show paths in plaintext (`set /env/prod/stripe_key`). That's what makes undo
+possible (`git -C "$PM_DATA" log`, then check out an older `keys.db`), but it also means:
+
+- After rotating a leaked secret, the leaked value is still in history.
+- If the master key is ever compromised, every value that ever existed can be decrypted.
+- Anyone who can read the repo, or a remote you push it to, sees all path names.
+
+(Inside `keys.db` itself, deleted and replaced values are zeroed.)
+
+To wipe history and keep only the current state (this also removes undo):
+
+```bash
+cd "$PM_DATA"
+old=$(git branch --show-current)
+git checkout -q --orphan pm-fresh
+git -c user.name=pm -c user.email=pm@local -c commit.gpgsign=false commit -qm "history reset"
+git branch -D -q "$old" && git branch -m "$old"
+git reflog expire --expire=now --all && git gc -q --prune=now
+```
+
+Copies elsewhere (pushed remotes, backups, Time Machine) are not affected.

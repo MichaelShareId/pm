@@ -171,7 +171,12 @@ v2
 ### Other notes
 
 - `list` does not decrypt (paths only).
-- Clipboard (`arboard`) is convenience; no auto-clear timer in v1.
+- Clipboard (`arboard`): copies are marked concealed (skipped by clipboard managers) and
+  cleared after `PM_CLIPBOARD_CLEAR` seconds (default 45) by a detached helper, only if
+  the clipboard still holds the secret.
+- Git history keeps every old value (ciphertext) and path names in commit messages; `rm`
+  only removes from the current `keys.db` (zeroed via `secure_delete`). README documents
+  how to wipe history.
 - `inject` puts secrets in the child environment (by design).
 
 ---
