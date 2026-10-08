@@ -93,6 +93,35 @@ pub fn path_to_env_name(path: &str, mask: Option<&str>) -> Result<String> {
     Ok(name)
 }
 
+/// Env vars that change how a process or its children find and load code, or that pm uses
+/// itself. A stored secret silently overriding one of these is almost never intended.
+const RESERVED_ENV_NAMES: &[&str] = &[
+    "PATH", "HOME", "SHELL", "USER", "LOGNAME", "TMPDIR", "IFS", "ENV", "BASH_ENV", "PS4",
+    "PROMPT_COMMAND", "NODE_OPTIONS", "NODE_PATH", "PYTHONPATH", "PYTHONHOME",
+    "PYTHONSTARTUP", "PERL5OPT", "PERL5LIB", "RUBYOPT", "RUBYLIB", "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+];
+const RESERVED_ENV_PREFIXES: &[&str] = &["DYLD_", "LD_", "PM_", "_PM_"];
+
+fn is_reserved_env_name(name: &str) -> bool {
+    RESERVED_ENV_NAMES.contains(&name) || RESERVED_ENV_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Refuse `(path, env name)` mappings that would silently lose or misuse a secret:
+/// two paths mapping to the same name, or (unless allowed) a reserved name.
+pub fn check_env_names(pairs: &[(&str, &str)], allow_reserved: bool) -> Result<()> {
+    let mut seen = std::collections::HashMap::new();
+    for &(path, name) in pairs {
+        if let Some(other) = seen.insert(name, path) {
+            bail!("{other} and {path} both map to env name {name}; rename one or use --mask");
+        }
+        if !allow_reserved && is_reserved_env_name(name) {
+            bail!("{path} maps to reserved env name {name}; pass --allow-reserved if intended");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +164,15 @@ mod tests {
             path_to_env_name("/a/b/d", prefix_env_mask("/a/b").unwrap().as_deref()).unwrap(),
             "B_D"
         );
+    }
+
+    #[test]
+    fn env_name_checks() {
+        assert!(check_env_names(&[("/a/x", "A_X"), ("/a/y", "A_Y")], false).is_ok());
+        let err = check_env_names(&[("/a/b-c", "A_B_C"), ("/a/b/c", "A_B_C")], true).unwrap_err();
+        assert!(err.to_string().contains("/a/b-c and /a/b/c"));
+        assert!(check_env_names(&[("/env/path", "PATH")], false).is_err());
+        assert!(check_env_names(&[("/env/dyld_x", "DYLD_X")], false).is_err());
+        assert!(check_env_names(&[("/env/path", "PATH")], true).is_ok());
     }
 }

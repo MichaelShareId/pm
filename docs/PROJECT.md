@@ -80,8 +80,12 @@ Rules (see `src/pathutil.rs`):
 - When `--prefix` is set and `--mask` is omitted, env names keep the last prefix segment (`--prefix /a/b` → `/a/b/c` maps to `B_C`).
 - Within segments, `-` and `.` become `_` (so `/gather/bot-ox/secret` → `BOT_OX_SECRET`).
 - Reject empty or invalid env names after masking.
+- Reject two paths mapping to the same name (`/a/b-c` and `/a/b/c` → `A_B_C`).
+- Reject reserved names (`PATH`, `HOME`, `DYLD_*`, `LD_*`, `NODE_OPTIONS`, `PYTHONPATH`, `PM_*`, …)
+  unless `--allow-reserved` is passed. Checked before the Touch ID prompt.
 
-Prefix match for inject/list: exact path **or** `path LIKE '{prefix}/%'`.
+Prefix match for inject/list: exact path **or** paths starting with `{prefix}/`
+(exact, case-sensitive comparison; not `LIKE`, whose `_`/`%` are wildcards).
 
 ---
 

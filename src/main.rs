@@ -17,7 +17,7 @@ use crate::auth::{ensure_touch_id, load_existing_master_key, load_master_key, st
 use crate::config::DataDir;
 use crate::crypto::{decrypt, encrypt, generate_master_key, MasterKey};
 use crate::gitutil::commit_db;
-use crate::pathutil::{normalize_path, path_to_env_name, prefix_env_mask};
+use crate::pathutil::{check_env_names, normalize_path, path_to_env_name, prefix_env_mask};
 use crate::store::Store;
 
 #[derive(Debug, Parser)]
@@ -74,6 +74,9 @@ enum Commands {
         /// Strip this prefix before building env names (overrides `--prefix` naming)
         #[arg(long = "mask")]
         mask: Option<String>,
+        /// Allow env names like PATH, DYLD_*, NODE_OPTIONS that change how programs load code
+        #[arg(long)]
+        allow_reserved: bool,
         /// Command and args after `--`
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -87,6 +90,9 @@ enum Commands {
         /// Strip this prefix before building env names (overrides `--prefix` naming)
         #[arg(long = "mask")]
         mask: Option<String>,
+        /// Allow env names like PATH, DYLD_*, NODE_OPTIONS that change how programs load code
+        #[arg(long)]
+        allow_reserved: bool,
     },
     /// List stored paths, or env names that `--prefix` would inject
     List {
@@ -135,9 +141,14 @@ fn run() -> Result<()> {
         Commands::Inject {
             prefix,
             mask,
+            allow_reserved,
             command,
-        } => cmd_inject(prefix.as_deref(), mask.as_deref(), &command, policy),
-        Commands::Dump { prefix, mask } => cmd_dump(prefix.as_deref(), mask.as_deref(), policy),
+        } => cmd_inject(prefix.as_deref(), mask.as_deref(), allow_reserved, &command, policy),
+        Commands::Dump {
+            prefix,
+            mask,
+            allow_reserved,
+        } => cmd_dump(prefix.as_deref(), mask.as_deref(), allow_reserved, policy),
         Commands::List { prefix, path } => cmd_list(prefix.as_deref(), path.as_deref()),
         Commands::Rm { path } => cmd_rm(&path, policy),
         Commands::Unlock => cmd_unlock(policy),
@@ -286,6 +297,7 @@ fn resolve_env_mask(prefix: Option<&str>, mask: Option<&str>) -> Result<Option<S
 fn load_env_pairs(
     prefix: Option<&str>,
     mask: Option<&str>,
+    allow_reserved: bool,
     reason_verb: &str,
     policy: session::Policy,
 ) -> Result<Vec<(String, Zeroizing<String>)>> {
@@ -306,6 +318,18 @@ fn load_env_pairs(
         }
     }
 
+    // Check names before Touch ID: a bad mapping fails without prompting or decrypting.
+    let names = rows
+        .iter()
+        .map(|row| path_to_env_name(&row.path, env_mask.as_deref()))
+        .collect::<Result<Vec<_>>>()?;
+    let pairs: Vec<(&str, &str)> = rows
+        .iter()
+        .zip(&names)
+        .map(|(row, name)| (row.path.as_str(), name.as_str()))
+        .collect();
+    check_env_names(&pairs, allow_reserved)?;
+
     let reason = match prefix.as_deref() {
         Some(prefix) => format!("pm: {reason_verb} {prefix}"),
         None => format!("pm: {reason_verb}"),
@@ -313,8 +337,7 @@ fn load_env_pairs(
     let key = unlock_key(&data, &reason, policy)?;
     let mut envs: Vec<(String, Zeroizing<String>)> = Vec::with_capacity(rows.len());
 
-    for row in rows {
-        let name = path_to_env_name(&row.path, env_mask.as_deref())?;
+    for (row, name) in rows.iter().zip(names) {
         let plaintext = decrypt(&key, row.path.as_bytes(), &row.nonce, &row.ciphertext)?;
         let value = Zeroizing::new(
             String::from_utf8(plaintext.to_vec())
@@ -328,6 +351,7 @@ fn load_env_pairs(
 fn cmd_inject(
     prefix: Option<&str>,
     mask: Option<&str>,
+    allow_reserved: bool,
     command: &[String],
     policy: session::Policy,
 ) -> Result<()> {
@@ -344,7 +368,7 @@ fn cmd_inject(
         (&command[0], &command[1..])
     };
 
-    let envs = load_env_pairs(prefix, mask, "inject", policy)?;
+    let envs = load_env_pairs(prefix, mask, allow_reserved, "inject", policy)?;
 
     let mut child = Command::new(prog);
     child
@@ -366,8 +390,13 @@ fn cmd_inject(
     Ok(())
 }
 
-fn cmd_dump(prefix: Option<&str>, mask: Option<&str>, policy: session::Policy) -> Result<()> {
-    let envs = load_env_pairs(prefix, mask, "dump", policy)?;
+fn cmd_dump(
+    prefix: Option<&str>,
+    mask: Option<&str>,
+    allow_reserved: bool,
+    policy: session::Policy,
+) -> Result<()> {
+    let envs = load_env_pairs(prefix, mask, allow_reserved, "dump", policy)?;
     let mut out = io::stdout().lock();
     // Quote everything first so a bad value fails before any secret is printed.
     let mut lines = Vec::with_capacity(envs.len());
