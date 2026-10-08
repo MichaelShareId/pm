@@ -93,7 +93,7 @@ $PM_DATA/
   keys.db          # SQLite secrets
   .lock            # exclusive write lock (fs4); gitignored
   .session         # unlocked master-key cache; mode 0600; gitignored
-  .gitignore       # .lock + .session
+  .gitignore       # .lock, .session, SQLite side files (-journal, -wal, -shm)
 ```
 
 ### SQLite (`keys.db`)
@@ -107,7 +107,7 @@ CREATE TABLE secrets (
 );
 ```
 
-Only ciphertext on disk. WAL mode enabled.
+Only ciphertext on disk. Rollback journal (`journal_mode=DELETE`), not WAL, so each write is in `keys.db` before the git commit.
 
 ### Session file (`.session`)
 
