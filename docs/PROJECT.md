@@ -115,7 +115,30 @@ Only ciphertext on disk. Rollback journal (`journal_mode=DELETE`), not WAL, so e
 
 ### Session file (`.session`)
 
-Plaintext format (owner-only file):
+Owner-only file. Preferred format, with a local ssh-agent (`agent.rs`):
+
+```
+v3
+<expires_unix_secs>
+<unlocked_at_unix_secs>
+<agent_socket_path>
+<ed25519_public_key_hex>
+<challenge_hex>        # 32 random bytes
+<nonce_hex>
+<ciphertext_hex>       # master key, XChaCha20-Poly1305
+```
+
+- On unlock: generate a throwaway ed25519 key, add it to the agent with lifetime
+  `PM_SESSION_MAX` (`SSH2_AGENTC_ADD_ID_CONSTRAINED`), have the agent sign
+  `"pm-session-v3\0" || challenge`, derive the session key as
+  `HKDF-SHA256(salt = challenge, ikm = signature, info = "pm session key v3")`, and
+  encrypt the master key (AAD = context, unlocked_at, public key, challenge).
+- On use: ask the agent to sign again (ed25519 is deterministic → same key) and verify
+  the signature against the stored public key before deriving.
+- `pm lock` / expiry / corruption remove the key from the agent too.
+- Agent not used when `SSH_CONNECTION` is set (forwarded agent).
+
+Fallback without a usable agent (warning printed):
 
 ```
 v2
@@ -164,9 +187,13 @@ v2
 
 ### Session cache tradeoff
 
-- Cross-process convenience: master key sits on disk under `PM_DATA` for TTL seconds.
-- Mitigations: `0600`, gitignored, short TTL, hard max lifetime, `pm lock`, TTL=`0`.
-- Not as strong as an in-memory agent; acceptable for the stated 3‑minute UX.
+- Cross-process convenience: any process of the same user can use an unlocked session
+  (read the v2 file, or ask the agent to unseal v3). Only a custom agent that verifies
+  the calling binary could prevent that.
+- v3 keeps the key off disk: a leaked/copied `.session` is useless, and the agent enforces
+  the hard limit.
+- Mitigations: `0600` file in a `0700` dir, gitignored, short TTL, hard max lifetime,
+  `pm lock`, TTL=`0`.
 
 ### Other notes
 
@@ -190,12 +217,13 @@ src/
   store.rs      # SQLite + write lock
   crypto.rs     # MasterKey, encrypt/decrypt
   auth.rs       # Keychain + Touch ID
-  session.rs    # .session cache load/save/clear/status
+  session.rs    # .session cache load/save/clear/status (v3 sealed via agent, v2 fallback)
+  agent.rs      # minimal ssh-agent client (add with lifetime, sign, remove)
   pathutil.rs   # normalize_path, path_to_env_name
   gitutil.rs    # git init / add / commit
 ```
 
-Dependencies (high level): `clap`, `rusqlite` (bundled), `fs4`, `chacha20poly1305`, `zeroize`, `rpassword`, `arboard`, `anyhow`, macOS: `security-framework`, `objc2*`, `block2`.
+Dependencies (high level): `clap`, `rusqlite` (bundled), `fs4`, `chacha20poly1305`, `zeroize`, `rpassword`, `arboard`, `anyhow`, `ed25519-dalek` + `hkdf` + `sha2` (session sealing), macOS: `security-framework`, `objc2*`, `block2`.
 
 ---
 
@@ -206,7 +234,7 @@ Dependencies (high level): `clap`, `rusqlite` (bundled), `fs4`, `chacha20poly130
 | DB | Single SQLite file (`keys.db`) |
 | Cipher | XChaCha20-Poly1305, AAD = path |
 | Auth UX | Touch ID (LA) before Keychain master-key use |
-| Session | File-backed sliding TTL (default 180s) + hard max (default 900s), configurable |
+| Session | Sliding TTL (default 180s) + hard max (default 900s); key sealed via ssh-agent, plaintext fallback |
 | Git | Shell `git`, commit on write |
 | Default data dir | **None** — `PM_DATA` required (no silent `~/.…` default) |
 | Platform | macOS-first (Touch ID); non-macOS Touch ID errors out |
@@ -224,12 +252,12 @@ From the initial build plan discussion:
 | Phase 2 — crypto + Touch ID + Keychain | Done |
 | Phase 3 — git on write | Done |
 | Phase 4 — stdin/prompt, clipboard, inject | Done |
-| Phase 5 — session cache | Done (file-based, not agent) |
+| Phase 5 — session cache | Done (sealed via ssh-agent, plaintext file fallback) |
 | `list` / `rm` | Done |
 | Default `~/.local/share/pm` if `PM_DATA` unset | **Not done** (still required) |
 | Keychain item with biometry ACL on the secret itself | **Not done** (LA gate + generic password) |
-| In-memory unlock agent (ssh-agent style) | **Not done** (file session instead) |
-| Clipboard auto-clear timer | **Not done** |
+| In-memory unlock agent (ssh-agent style) | Partial: key sealed via ssh-agent; no caller verification |
+| Clipboard auto-clear timer | Done (`PM_CLIPBOARD_CLEAR`, default 45s) |
 | `pm rename` | **Not done** |
 | Biometry mock / `PM_SKIP_TOUCH_ID` for CI | **Not done** |
 | Integration test harness with temp vault | Partial (unit tests for pathutil + session only) |
@@ -241,8 +269,8 @@ From the initial build plan discussion:
 
 1. **Hardening**
    - Optional Secure Enclave / Keychain ACL requiring biometry to *read* the master key (in addition to LA gate).
-   - Replace file session with a small user agent holding the key in RAM + Unix socket.
-   - Clipboard clear-after-N-seconds best-effort on macOS.
+   - Custom agent that verifies the calling binary (peer PID → code signature) before
+     unsealing; the ssh-agent seal can't tell pm from other same-user processes.
 
 2. **UX**
    - `pm rename <from> <to>` (re-encrypt under new path AAD).

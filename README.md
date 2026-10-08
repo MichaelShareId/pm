@@ -29,9 +29,20 @@ pm init
 
 ## Session cache
 
-After a successful Touch ID unlock, the master key is cached in `$PM_DATA/.session`
+After a successful Touch ID unlock, the session is cached in `$PM_DATA/.session`
 (mode `0600`) for a sliding TTL (default **180s** / 3 minutes), capped by a hard limit
 from the unlock (default **900s** / 15 minutes).
+
+With a local ssh-agent (`SSH_AUTH_SOCK`, always set on macOS), the file holds only the
+master key **encrypted** with a key derived from an agent signature. The signing key is a
+throwaway ed25519 key that exists only in the agent, added with the hard limit as its
+agent lifetime. A copy of the file is useless on its own, and the session ends when the
+agent drops the key (lifetime, `pm lock`, `ssh-add -D`, logout). Without a usable agent
+(none running, an agent that refuses keys like 1Password's, or inside an SSH login where
+the agent is forwarded), pm warns and stores the master key in the file in plaintext.
+
+This protects against the file leaking (backups, disk access, copies). It does **not**
+protect against other programs running as you while unlocked: they can ask the agent too.
 
 ```bash
 # configure TTL (seconds); 0 = Touch ID every time
@@ -41,8 +52,8 @@ pm --session-ttl 300 get /env/dev/url   # per-invocation override
 export PM_SESSION_MAX=900
 
 pm unlock    # Touch ID once, start/refresh session
-pm status    # locked / unlocked + remaining seconds
-pm lock      # clear session now
+pm status    # locked / unlocked (via ssh-agent or plaintext file) + remaining seconds
+pm lock      # clear session now (and remove its key from the agent)
 ```
 
 Each `get` / `set` / `inject` / `dump` / `rm` that hits a valid session extends the TTL
