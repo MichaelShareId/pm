@@ -427,20 +427,25 @@ fn cmd_inject(
 
     let envs = load_env_pairs(prefix, mask, allow_reserved, "inject", policy)?;
 
-    let mut child = Command::new(prog);
-    child
+    let mut command = Command::new(prog);
+    command
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("_PM_INJECT", "1");
     for (name, value) in &envs {
-        child.env(name, value.as_str());
+        command.env(name, value.as_str());
     }
-
-    let status = child
-        .status()
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to run `{prog}`"))?;
+    // The child has its copy; don't keep plaintext in this process while it runs.
+    // (Command's own env copies can't be wiped, but are freed here too.)
+    drop(command);
+    drop(envs);
+
+    let status = child.wait().with_context(|| format!("wait for `{prog}`"))?;
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
@@ -545,14 +550,18 @@ fn strip_surrounding_quotes(s: &str) -> &str {
 
 fn read_secret_value(raw_value: bool) -> Result<Zeroizing<String>> {
     let stdin = io::stdin();
+    // Zeroizing from the first copy on, so no plaintext buffer is freed unwiped.
     let raw = if stdin.is_terminal() {
-        let value = rpassword::prompt_password("value: ").context("read hidden prompt")?;
+        let value =
+            Zeroizing::new(rpassword::prompt_password("value: ").context("read hidden prompt")?);
         if value.is_empty() {
             bail!("empty value");
         }
         value
     } else {
-        let mut buf = String::new();
+        // Preallocate so typical values don't trigger a reallocation (which would free an
+        // unwiped copy).
+        let mut buf = Zeroizing::new(String::with_capacity(16 * 1024));
         stdin.lock().read_to_string(&mut buf)?;
         if buf.ends_with('\n') {
             buf.pop();
