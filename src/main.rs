@@ -44,6 +44,9 @@ enum Commands {
     Set {
         /// Path key, e.g. /env/dev/url
         path: String,
+        /// Store the value exactly as given (don't strip one pair of surrounding quotes)
+        #[arg(long)]
+        raw: bool,
     },
     /// Get a secret
     Get {
@@ -114,7 +117,7 @@ fn run() -> Result<()> {
     let ttl = cli.session_ttl;
     match cli.command {
         Commands::Init => cmd_init(ttl),
-        Commands::Set { path } => cmd_set(&path, ttl),
+        Commands::Set { path, raw } => cmd_set(&path, raw, ttl),
         Commands::Get { path, output } => cmd_get(&path, output, ttl),
         Commands::Inject {
             prefix,
@@ -203,12 +206,12 @@ fn cmd_status(ttl: u64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_set(path: &str, ttl: u64) -> Result<()> {
+fn cmd_set(path: &str, raw: bool, ttl: u64) -> Result<()> {
     let path = normalize_path(path)?;
     let data = DataDir::resolve()?;
     data.require_initialized()?;
 
-    let value = read_secret_value()?;
+    let value = read_secret_value(raw)?;
     let key = unlock_key(&data, &format!("pm: set {path}"), ttl)?;
     let (nonce, ciphertext) = encrypt(&key, path.as_bytes(), value.as_bytes())?;
 
@@ -233,8 +236,10 @@ fn cmd_get(path: &str, output: Output, ttl: u64) -> Result<()> {
 
     let key = unlock_key(&data, &format!("pm: get {path}"), ttl)?;
     let plaintext = decrypt(&key, path.as_bytes(), &row.nonce, &row.ciphertext)?;
-    let text = String::from_utf8(plaintext.to_vec()).context("secret is not valid UTF-8")?;
-    let text = Zeroizing::new(strip_surrounding_quotes(&text).to_string());
+    // Output exactly what was stored; quotes were already handled by `set`.
+    let text = Zeroizing::new(
+        String::from_utf8(plaintext.to_vec()).context("secret is not valid UTF-8")?,
+    );
 
     match output {
         Output::Stdout => {
@@ -298,9 +303,10 @@ fn load_env_pairs(
     for row in rows {
         let name = path_to_env_name(&row.path, env_mask.as_deref())?;
         let plaintext = decrypt(&key, row.path.as_bytes(), &row.nonce, &row.ciphertext)?;
-        let text = String::from_utf8(plaintext.to_vec())
-            .with_context(|| format!("secret {} is not valid UTF-8", row.path))?;
-        let value = Zeroizing::new(strip_surrounding_quotes(&text).to_string());
+        let value = Zeroizing::new(
+            String::from_utf8(plaintext.to_vec())
+                .with_context(|| format!("secret {} is not valid UTF-8", row.path))?,
+        );
         envs.push((name, value));
     }
     Ok(envs)
@@ -400,6 +406,7 @@ fn cmd_rm(path: &str, ttl: u64) -> Result<()> {
 }
 
 /// Drop a single matching pair of surrounding `'` or `"` (common when pasting .env values).
+/// Applied once, on input only, so stored values are returned unchanged.
 fn strip_surrounding_quotes(s: &str) -> &str {
     let b = s.as_bytes();
     if b.len() >= 2 {
@@ -411,7 +418,7 @@ fn strip_surrounding_quotes(s: &str) -> &str {
     s
 }
 
-fn read_secret_value() -> Result<Zeroizing<String>> {
+fn read_secret_value(raw_value: bool) -> Result<Zeroizing<String>> {
     let stdin = io::stdin();
     let raw = if stdin.is_terminal() {
         let value = rpassword::prompt_password("value: ").context("read hidden prompt")?;
@@ -433,7 +440,15 @@ fn read_secret_value() -> Result<Zeroizing<String>> {
         }
         buf
     };
-    let value = strip_surrounding_quotes(&raw);
+    prepare_value(&raw, raw_value)
+}
+
+fn prepare_value(input: &str, raw_value: bool) -> Result<Zeroizing<String>> {
+    let value = if raw_value {
+        input
+    } else {
+        strip_surrounding_quotes(input)
+    };
     if value.is_empty() {
         bail!("empty value");
     }
@@ -442,7 +457,7 @@ fn read_secret_value() -> Result<Zeroizing<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_surrounding_quotes;
+    use super::{prepare_value, strip_surrounding_quotes};
 
     #[test]
     fn strips_matching_quotes() {
@@ -452,5 +467,12 @@ mod tests {
         assert_eq!(strip_surrounding_quotes(r#""hello'"#), r#""hello'"#);
         assert_eq!(strip_surrounding_quotes(r#""""#), "");
         assert_eq!(strip_surrounding_quotes("'"), "'");
+    }
+
+    #[test]
+    fn set_strips_quotes_once_and_raw_keeps_them() {
+        assert_eq!(prepare_value(r#""'abc'""#, false).unwrap().as_str(), "'abc'");
+        assert_eq!(prepare_value(r#""abc""#, true).unwrap().as_str(), r#""abc""#);
+        assert!(prepare_value(r#""""#, false).is_err());
     }
 }

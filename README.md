@@ -49,6 +49,9 @@ Each `get` / `set` / `inject` / `rm` that hits a valid session extends the TTL a
 ```bash
 # Store (stdin, or hidden prompt on a TTY)
 echo -n 'https://example.com' | pm set /env/dev/url
+# One pair of surrounding quotes is stripped on input ("x" → x, handy for .env pastes);
+# --raw stores the value exactly as given. Reads always return the stored value unchanged.
+echo -n '"quoted"' | pm set --raw /env/dev/literal
 
 # Read
 pm get /env/dev/url
